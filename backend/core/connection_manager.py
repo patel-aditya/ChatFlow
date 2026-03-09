@@ -17,11 +17,11 @@ class ConnectionManager:
         if websocket:
             await websocket.send_json(message)
 
-    async def broadcast_to_users(self, message: dict, user_ids: List[int]);
+    async def broadcast_to_users(self, message: dict, user_ids: List[int]):
         for user_id in user_ids:
             await self.send_personal_message(message, user_id)
 
-    def is_online(self, user_id: int) ->bool;
+    def is_online(self, user_id: int) ->bool:
         return user_id in self.active_connections
     
     
