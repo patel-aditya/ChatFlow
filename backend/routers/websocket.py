@@ -1,9 +1,10 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy.orm import Session
 import json
 
-from database import get_db, SessionLocal
+from database import SessionLocal
 from core.connection_manager import manager
+from core.auth import decode_access_token
 from models.message import Message
 from models.conversation_member import ConversationMember
 from models.user import User
@@ -12,7 +13,7 @@ from models.user import User
 router = APIRouter(tags=["WebSocket"])
 
 
-# ── helper: get all member ids of a conversation ──────────────────
+# ── Helper: get all member ids of a conversation ──────────────────
 def get_conversation_member_ids(conversation_id: int, db: Session):
     members = db.query(ConversationMember.user_id).filter(
         ConversationMember.conversation_id == conversation_id
@@ -20,22 +21,48 @@ def get_conversation_member_ids(conversation_id: int, db: Session):
     return [member[0] for member in members]
 
 
+# ── Helper: mark user online/offline safely ───────────────────────
+def set_user_online(user_id: int, db: Session, status: bool):
+    user = db.query(User).filter(User.id == user_id).first()
+    if user:
+        user.is_online = status
+        db.commit()
+
+
 # ── WebSocket Connection ──────────────────────────────────────────
 @router.websocket("/ws/{user_id}")
-async def websocket_endpoint(user_id: int, websocket: WebSocket):
+async def websocket_endpoint(
+    user_id: int,
+    websocket: WebSocket,
+    token: str = Query(...)         # FIX 2: require JWT token as query param
+):
     db = SessionLocal()
+
+    # ── Auth Check ────────────────────────────────────────────────
+    try:
+        payload = decode_access_token(token)
+        token_user_id = int(payload.get("sub"))
+
+        if token_user_id != user_id:
+            print(f"🚫 Token user_id {token_user_id} != path user_id {user_id}")
+            await websocket.close(code=1008)   # 1008 = Policy Violation
+            db.close()
+            return
+
+    except Exception as e:
+        print(f"🚫 Invalid token for user {user_id}: {e}")
+        await websocket.close(code=1008)
+        db.close()
+        return
+
+    # ── Main Connection Loop ──────────────────────────────────────
     try:
         print(f"🔌 Attempting to connect user {user_id}")
         await manager.connect(user_id, websocket)
         print(f"✅ User {user_id} connected successfully")
 
-        user = db.query(User).filter(User.id == user_id).first()
-        print(f"👤 User found: {user}")
-
-        if user:
-            user.is_online = True
-            db.commit()
-            print(f"✅ User {user_id} marked online")
+        set_user_online(user_id, db, True)
+        print(f"✅ User {user_id} marked online")
 
         while True:
             data = await websocket.receive_text()
@@ -43,6 +70,7 @@ async def websocket_endpoint(user_id: int, websocket: WebSocket):
             payload = json.loads(data)
             event_type = payload.get("type")
 
+            # ── Send Message ──────────────────────────────────────
             if event_type == "message":
                 conversation_id = payload.get("conversation_id")
                 content = payload.get("content")
@@ -77,6 +105,7 @@ async def websocket_endpoint(user_id: int, websocket: WebSocket):
                 print(f"📢 Broadcasting to members: {member_ids}")
                 await manager.broadcast_to_users(message_payload, member_ids)
 
+            # ── Typing Indicator ──────────────────────────────────
             elif event_type == "typing":
                 conversation_id = payload.get("conversation_id")
                 is_typing = payload.get("is_typing")
@@ -90,6 +119,7 @@ async def websocket_endpoint(user_id: int, websocket: WebSocket):
                 other_member_ids = [id for id in member_ids if id != user_id]
                 await manager.broadcast_to_users(typing_payload, other_member_ids)
 
+            # ── Read Receipt ──────────────────────────────────────
             elif event_type == "read":
                 conversation_id = payload.get("conversation_id")
                 db.query(Message).filter(
@@ -98,6 +128,7 @@ async def websocket_endpoint(user_id: int, websocket: WebSocket):
                     Message.is_read == False
                 ).update({"is_read": True})
                 db.commit()
+
                 read_payload = {
                     "type": "read",
                     "conversation_id": conversation_id,
@@ -107,18 +138,19 @@ async def websocket_endpoint(user_id: int, websocket: WebSocket):
                 other_member_ids = [id for id in member_ids if id != user_id]
                 await manager.broadcast_to_users(read_payload, other_member_ids)
 
+    # ── Clean Disconnect ──────────────────────────────────────────
     except WebSocketDisconnect:
         print(f"🔌 User {user_id} disconnected")
         manager.disconnect(user_id)
-        user = db.query(User).filter(User.id == user_id).first()
-        if user:
-            user.is_online = False
-            db.commit()
+        set_user_online(user_id, db, False)
 
+    # ── FIX 1: Cleanup on ANY unexpected crash ────────────────────
     except Exception as e:
         print(f"🔥 CRASH for user {user_id}: {e}")
         import traceback
         traceback.print_exc()
+        manager.disconnect(user_id)          # remove ghost connection
+        set_user_online(user_id, db, False)  # mark user offline
 
     finally:
         db.close()
